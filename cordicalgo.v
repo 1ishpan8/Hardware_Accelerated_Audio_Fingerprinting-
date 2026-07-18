@@ -24,6 +24,7 @@ module cordicalgo #(
     parameter DATA_WIDTH = 16
 )(
     input  wire                  clk,
+    input  wire                  rst_n,
     input  wire [DATA_WIDTH-1:0] X_in,      // Real from FFT
     input  wire [DATA_WIDTH-1:0] Y_in,      // Imaginary from FFT
     output wire [DATA_WIDTH:0]   magnitude  // Output Magnitude
@@ -35,6 +36,7 @@ module cordicalgo #(
     reg signed [DATA_WIDTH:0] Y [0:BIT_WIDTH-1];
 
     always @(posedge clk) begin
+                                                 
         X[0] <= (X_in[DATA_WIDTH-1]) ? -X_in : X_in;
         Y[0] <= (Y_in[DATA_WIDTH-1]) ? -Y_in : Y_in;
     end

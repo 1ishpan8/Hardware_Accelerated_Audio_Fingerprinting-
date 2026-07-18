@@ -1,128 +1,176 @@
 `timescale 1ns / 1ps
-
+//
+// fft_top - CNN integration FIXED
+//  * Signals renamed to the ones that actually exist: valid trigger is
+//    frame_done_pulse, data is packed_fingerprint (the uploaded version
+//    referenced two nonexistent nets, creating undriven implicit wires).
+//  * SINGLE driver on m_axis_feat_*: the class prediction is latched into
+//    the same AXI-Stream holding register (tvalid held until tready) -
+//    the direct assign from cnn_final_valid was both a double-drive and a
+//    re-introduction of the one-cycle-pulse protocol violation.
+//  * rst_n wired into every CNN layer (required for X-free simulation).
+//  Payload: {8'd0, class[5:0], fingerprint[49:0]}
+//  C side:  class_id = (u64_word >> 50) & 0x3F;
+//
 module fft_top (
     input  wire        clk,
     input  wire        rst_n,
-    
-    // Testbench Audio Input 
-    input  wire [31:0] audio_in_tdata,  
-    input  wire        audio_in_tvalid,
-    output wire        audio_in_tready,
-    input  wire        audio_in_tlast
-);
 
-    // --- 1. INTERNAL WIRES ---
-    // FFT to Delay Lines
+    input  wire [31:0] s_axis_aud_tdata,
+    input  wire        s_axis_aud_tvalid,
+    output wire        s_axis_aud_tready,
+    input  wire        s_axis_aud_tlast,
+
+    output wire [63:0] m_axis_feat_tdata,
+    output wire [7:0]  m_axis_feat_tkeep,
+    output wire        m_axis_feat_tvalid,
+    input  wire        m_axis_feat_tready,
+    output wire        m_axis_feat_tlast
+);
+    // NOTE: if on-board magnitudes ever look overflowed, revisit this per
+    // PG109 for your xfft configuration (scaling schedule lives here).
+    localparam [15:0] FFT_CONFIG = 16'h0001;
+
     wire [31:0] fft_out_tdata;
-    wire        fft_out_tvalid;
-    wire        fft_out_tlast;
-    
-    // CORDIC to Peak Detector
-    wire        cordic_valid;
-    wire        frame_done_pulse; 
+    wire        fft_out_tvalid, fft_out_tlast;
     wire [16:0] cordic_magnitude;
-    
-    // Peak Detector to BRAM
+    wire        frame_done_pulse;
     wire [9:0]  peak_0, peak_1, peak_2, peak_3, peak_4;
     wire [49:0] packed_fingerprint;
-    
-    // BRAM Pointer
-    reg  [6:0]  write_ptr;
-
-    // --- 2. THE FFT FRONT-END ---
-    wire config_tready;
-    reg  config_done;
+    wire        config_tready;
+    reg         config_done;
 
     always @(posedge clk) begin
-        if (!rst_n) 
-            config_done <= 1'b0;
-        else if (config_tready && !config_done) 
-            config_done <= 1'b1; 
+        if (!rst_n)                             config_done <= 1'b0;
+        else if (config_tready && !config_done) config_done <= 1'b1;
     end
 
     xfft_0 fft_inst (
-        .aclk(clk),
-        .aresetn(rst_n),
-        .s_axis_config_tdata(8'b0000_0001), 
+        .aclk(clk), .aresetn(rst_n),
+        .s_axis_config_tdata(FFT_CONFIG),
         .s_axis_config_tvalid(~config_done),
         .s_axis_config_tready(config_tready),
-        
-        .s_axis_data_tdata(audio_in_tdata),
-        .s_axis_data_tvalid(audio_in_tvalid),
-        .s_axis_data_tready(audio_in_tready), 
-        .s_axis_data_tlast(audio_in_tlast),
-        
+        .s_axis_data_tdata(s_axis_aud_tdata),
+        .s_axis_data_tvalid(s_axis_aud_tvalid),
+        .s_axis_data_tready(s_axis_aud_tready),
+        .s_axis_data_tlast(s_axis_aud_tlast),
         .m_axis_data_tdata(fft_out_tdata),
         .m_axis_data_tvalid(fft_out_tvalid),
-        .m_axis_data_tready(1'b1), // Always ready to receive
+        .m_axis_data_tready(1'b1),
         .m_axis_data_tlast(fft_out_tlast)
     );
 
-    // --- 3. THE 16-CYCLE SHIFT REGISTERS ---
-    // This perfectly synchronizes the FFT's valid and last signals with 
-    // the 16-cycle mathematical delay of your custom CORDIC pipeline.
     reg [15:0] valid_delay_line;
-    reg [15:0] tlast_delay_line;
-
     always @(posedge clk) begin
-        if (!rst_n) begin
-            valid_delay_line <= 16'd0;
-            tlast_delay_line <= 16'd0;
-        end else begin
-            valid_delay_line <= {valid_delay_line[14:0], fft_out_tvalid};
-            tlast_delay_line <= {tlast_delay_line[14:0], fft_out_tlast};
-        end
+        if (!rst_n) valid_delay_line <= 16'd0;
+        else        valid_delay_line <= {valid_delay_line[14:0], fft_out_tvalid};
     end
 
-assign cordic_valid = valid_delay_line[15];
-
-
-    // --- 4. THE CORDIC ---
-    cordicalgo #(
-        .DATA_WIDTH(16)
-    ) my_cordic (
-        .clk(clk),
-        .X_in(fft_out_tdata[15:0]),  
-        .Y_in(fft_out_tdata[31:16]), 
+    cordicalgo #(.DATA_WIDTH(16)) my_cordic (
+        .clk(clk), .rst_n(rst_n),
+        .X_in(fft_out_tdata[15:0]),
+        .Y_in(fft_out_tdata[31:16]),
         .magnitude(cordic_magnitude)
     );
 
-    // --- 5. THE PEAK DETECTOR ---
     peak_detector my_sorter (
-        .clk(clk),
-        .rst_n(~rst_n),
+        .clk(clk), .rst_n(rst_n),
         .data_in(cordic_magnitude),
-        .data_en(cordic_valid),
-        .fingerprint_0(peak_0),
-        .fingerprint_1(peak_1),
-        .fingerprint_2(peak_2),
-        .fingerprint_3(peak_3),
+        .data_en(valid_delay_line[15]),
+        .fingerprint_0(peak_0), .fingerprint_1(peak_1),
+        .fingerprint_2(peak_2), .fingerprint_3(peak_3),
         .fingerprint_4(peak_4),
-        .fingerprint_valid(frame_done_pulse) 
+        .fingerprint_valid(frame_done_pulse)
     );
 
-    // --- 6. THE CIRCULAR BUFFER (RAM) ---
     assign packed_fingerprint = {peak_4, peak_3, peak_2, peak_1, peak_0};
 
-    // Safely increment write pointer only at the end of a valid 1024-point frame
+    // Hold the fingerprint stable for the whole CNN latency
+    reg [49:0] fp_hold;
     always @(posedge clk) begin
-        if (!rst_n) 
-            write_ptr <= 7'd0;
-        else if (frame_done_pulse) 
-            write_ptr <= write_ptr + 1'b1;
+        if (!rst_n)                fp_hold <= 50'd0;
+        else if (frame_done_pulse) fp_hold <= packed_fingerprint;
     end
 
-    dual_buffer_ram #(
-        .DATA_WIDTH(50),
-        .DATA_DEPTH(128)
-    ) audio_history_buffer (
-        .clk(clk),
-        .write_enable(frame_done_pulse), 
-        .wr_addr(write_ptr),
-        .data_in_a(packed_fingerprint),
-        .read_enable(1'b0), 
-        .rd_addr(7'd0),
-        .data_out_b()
+    // ---------------- CNN pipeline (3 classes) ----------------
+    wire [12799:0] conv1_to_pool1;
+    wire [6399:0]  pool1_to_conv2;
+    wire [12799:0] conv2_to_pool2;
+    wire [6143:0]  pool2_to_fc1;
+    wire [1023:0]  fc1_to_fc2;
+    wire conv1_v, pool1_v, conv2_v, pool2_v, fc1_v, cnn_final_valid;
+    wire [5:0] predicted_class;
+
+    conv1_mac conv1_inst (
+        .clk(clk), .rst_n(rst_n),
+        .valid_in(frame_done_pulse),
+        .fingerprint_in(fp_hold),
+        .conv_out(conv1_to_pool1),
+        .valid_out(conv1_v)
     );
+
+    // 16ch, 50 -> 25   (module lives in maxpool_relu2.v)
+    relu_maxpool_layer2 pool1_inst (
+        .clk(clk), .rst_n(rst_n),
+        .valid_in(conv1_v),
+        .conv_in(conv1_to_pool1),
+        .pool_out(pool1_to_conv2),
+        .valid_out(pool1_v)
+    );
+
+    conv2_mac #(.FRAC_BITS(8)) conv2_inst (
+        .clk(clk), .rst_n(rst_n),
+        .valid_in(pool1_v),
+        .pool_in(pool1_to_conv2),
+        .conv2_out(conv2_to_pool2),
+        .valid_out(conv2_v)
+    );
+
+    // 32ch, 25 -> 12   (module lives in maxpool_relu1.v)
+    relu_maxpool2_layer pool2_inst (
+        .clk(clk), .rst_n(rst_n),
+        .valid_in(conv2_v),
+        .conv_in(conv2_to_pool2),
+        .pool_out(pool2_to_fc1),
+        .valid_out(pool2_v)
+    );
+
+    fc_layer1 #(.FRAC_BITS(8)) fc1_inst (
+        .clk(clk), .rst_n(rst_n),
+        .valid_in(pool2_v),
+        .flat_in(pool2_to_fc1),
+        .fc1_out(fc1_to_fc2),
+        .valid_out(fc1_v)
+    );
+
+    fc_layer2 #(.NUM_CLASSES(3), .FRAC_BITS(8)) fc2_inst (
+        .clk(clk), .rst_n(rst_n),
+        .valid_in(fc1_v),
+        .fc1_in(fc1_to_fc2),
+        .class_out(predicted_class),
+        .valid_out(cnn_final_valid)
+    );
+
+    // ------------- SINGLE AXI-Stream output stage -------------
+    reg [63:0] feat_data_r;
+    reg        feat_valid_r;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            feat_data_r  <= 64'd0;
+            feat_valid_r <= 1'b0;
+        end else begin
+            if (cnn_final_valid) begin
+                feat_data_r  <= {8'd0, predicted_class, fp_hold};
+                feat_valid_r <= 1'b1;
+            end else if (feat_valid_r && m_axis_feat_tready) begin
+                feat_valid_r <= 1'b0;
+            end
+        end
+    end
+
+    assign m_axis_feat_tdata  = feat_data_r;
+    assign m_axis_feat_tvalid = feat_valid_r;
+    assign m_axis_feat_tlast  = feat_valid_r;
+    assign m_axis_feat_tkeep  = 8'hFF;
 
 endmodule

@@ -19,7 +19,6 @@
 // 
 //////////////////////////////////////////////////////////////////////////////////
 
-`timescale 1ns / 1ps
 
 module tb_fft_top();
 
@@ -52,7 +51,7 @@ module tb_fft_top();
 
     initial begin
         // Load the Python-generated hex file
-        $readmemh("song_data.mem", rom_memory);
+        $readmemh("C:/fft_cnn_dataset/master_input.mem", rom_memory);
         $display("ROM successfully loaded with audio data.");
 
         // Initialize 
@@ -96,8 +95,7 @@ module tb_fft_top();
         #20000; 
 
         // Export the True Dual-Port BRAM contents to a physical file
-        $writememh("extracted_features.mem", uut.audio_history_buffer.ram_memory);
-
+        $writememh("C:/fft_cnn_dataset/master_features.mem", uut.audio_history_buffer.ram_memory);
         $display("SIMULATION COMPLETE. Features written to extracted_features.mem");
         $finish;
     end
